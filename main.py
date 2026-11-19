@@ -1,14 +1,13 @@
 import os, io, re, csv, json, time, base64, smtplib, secrets
-import psycopg
-from psycopg.rows import dict_row
 from email.message import EmailMessage
-import anthropic, httpx
+import httpx
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
-DBURL = os.environ["DATABASE_URL"]
+DBURL = os.getenv("DATABASE_URL", "")
+_ready = False
 sec = HTTPBasic()
 
 def auth(c: HTTPBasicCredentials = Depends(sec)):
@@ -19,7 +18,50 @@ def auth(c: HTTPBasicCredentials = Depends(sec)):
 
 app = FastAPI(dependencies=[Depends(auth)])
 
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def on_error(request, exc):
+    return JSONResponse({"detail": f"{type(exc).__name__}: {str(exc)[:200]}"}, status_code=500)
+
+@app.get("/api/health")
+def health():
+    out = {}
+    try:
+        q("SELECT 1 x")
+        out["database"] = "ok"
+    except Exception as e:
+        out["database"] = "FAILED: " + str(e)[:200]
+    out["gemini_key_set"] = bool(os.getenv("GEMINI_API_KEY"))
+    out["anthropic_key_set"] = bool(os.getenv("ANTHROPIC_API_KEY"))
+    try:
+        sample = {"type": "text", "text": PROMPT + "\nCV: Ali Khan, ali@example.com, +923001234567, Software Engineer"}
+        if os.getenv("GEMINI_API_KEY") and not os.getenv("ANTHROPIC_API_KEY"):
+            out["parser"] = "ok: " + gemini(sample)[:80]
+        else:
+            import anthropic
+            m = anthropic.Anthropic().messages.create(model=os.getenv("MODEL", "claude-sonnet-5-5"), max_tokens=50,
+                                                      messages=[{"role": "user", "content": "Say ok"}])
+            out["parser"] = "ok"
+    except Exception as e:
+        out["parser"] = "FAILED: " + str(e)[:300]
+    out["smtp_host"] = os.getenv("SMTP_HOST") or "NOT SET"
+    out["smtp_login_set"] = bool(os.getenv("SMTP_USER") and os.getenv("SMTP_PASS"))
+    return out
+
 def q(sql, args=(), many=False, write=False):
+    global _ready
+    if not DBURL:
+        raise RuntimeError("DATABASE_URL is not set in Vercel environment variables")
+    if not _ready:
+        _ready = True
+        try:
+            init()
+        except Exception:
+            _ready = False
+            raise
+    import psycopg  # imported lazily so a driver problem is reported instead of crashing the app
+    from psycopg.rows import dict_row
     sql = sql.replace("?", "%s")
     ins = sql.lstrip().upper().startswith("INSERT")
     if ins:
@@ -48,7 +90,6 @@ def init():
             ("Interview invitation", "Interview invitation: {job_title} at {company}",
              "Hi {first_name},\n\nWe'd like to invite you to interview for the {job_title} role at {company}. Which day suits you?")]:
             q("INSERT INTO templates(name,subject,body) VALUES(?,?,?)", (n, s, b), write=True)
-init()
 
 # ---------- CV parsing ----------
 PROMPT = ('Extract this CV into JSON only, no prose or code fences, using exactly these keys: '
@@ -99,6 +140,7 @@ def parse(file: UploadFile = File(...)):
         if os.getenv("GEMINI_API_KEY") and not os.getenv("ANTHROPIC_API_KEY"):
             raw = gemini(block)  # free tier
         else:
+            import anthropic
             msg = anthropic.Anthropic().messages.create(
                 model=os.getenv("MODEL", "claude-sonnet-5-5"), max_tokens=2500,
                 messages=[{"role": "user", "content": [block, {"type": "text", "text": PROMPT}]}])
