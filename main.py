@@ -77,25 +77,44 @@ def to_block(fn: str, data: bytes):
         raise HTTPException(400, "Unsupported file type. Use PDF, DOCX, TXT, PNG or JPG.")
     return {"type": "text", "text": "CV text:\n" + text}
 
+def gemini(block):
+    part = {"text": block["text"]} if block["type"] == "text" else \
+        {"inline_data": {"mime_type": block["source"]["media_type"], "data": block["source"]["data"]}}
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    r = httpx.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                   headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]},
+                   json={"contents": [{"parts": [part, {"text": PROMPT}]}],
+                         "generationConfig": {"responseMimeType": "application/json"}}, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:200]}")
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+
 @app.post("/api/parse")
 def parse(file: UploadFile = File(...)):
     data = file.file.read()
     if len(data) > 4_000_000:
         raise HTTPException(413, "File too large (4 MB max on Vercel).")
     try:
-        msg = anthropic.Anthropic().messages.create(
-            model=os.getenv("MODEL", "claude-sonnet-5-5"), max_tokens=2500,
-            messages=[{"role": "user", "content": [to_block(file.filename, data), {"type": "text", "text": PROMPT}]}])
-        raw = "".join(b.text for b in msg.content if b.type == "text")
+        block = to_block(file.filename, data)
+        if os.getenv("GEMINI_API_KEY") and not os.getenv("ANTHROPIC_API_KEY"):
+            raw = gemini(block)  # free tier
+        else:
+            msg = anthropic.Anthropic().messages.create(
+                model=os.getenv("MODEL", "claude-sonnet-5-5"), max_tokens=2500,
+                messages=[{"role": "user", "content": [block, {"type": "text", "text": PROMPT}]}])
+            raw = "".join(b.text for b in msg.content if b.type == "text")
         p = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(502, f"Parsing failed: {e}")
     p["phone"] = re.sub(r"[^\d+]", "", p.get("phone") or "")
-    cid = q("INSERT INTO candidates(name,email,phone,role,location,language,data,source,created) VALUES(?,?,?,?,?,?,?,?,?)",
-            (p.get("name"), p.get("email"), p["phone"], p.get("current_role"), p.get("location"),
-             p.get("language"), json.dumps(p), "cv:" + file.filename, time.time()), write=True)
+    try:
+        cid = q("INSERT INTO candidates(name,email,phone,role,location,language,data,source,created) VALUES(?,?,?,?,?,?,?,?,?)",
+                (p.get("name"), p.get("email"), p["phone"], p.get("current_role"), p.get("location"),
+                 p.get("language"), json.dumps(p), "cv:" + file.filename, time.time()), write=True)
+    except Exception as e:
+        raise HTTPException(500, f"Database error (check DATABASE_URL): {str(e)[:150]}")
     return {"id": cid, **p}
 
 # ---------- Spreadsheet import ----------
