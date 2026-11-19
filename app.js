@@ -24,7 +24,16 @@ function fill(s,c){const f=(c.name||"there").split(" ")[0];return s.replace(/{fi
 function render(){const c=cands[0]||{name:"Maria Papadaki"};$("#prev").textContent=(channel==="Email"?"Subject: "+fill($("#subj").value,c)+"\n\n":"")+fill($("#body").value,c);}
 $("#tpl").onchange=pick;["#subj","#body","#job","#co"].forEach(s=>$(s).oninput=render);
 $$(".seg button").forEach(b=>b.onclick=()=>{channel=b.dataset.ch;$$(".seg button").forEach(x=>x.setAttribute("aria-pressed",x===b));render();});
-async function upload(path,file){const fd=new FormData();fd.append("file",file);return api(path,{method:"POST",body:fd});}
+async function upload(path,file,ms=100000){const fd=new FormData();fd.append("file",file);
+ const ctl=new AbortController(),t=setTimeout(()=>ctl.abort(),ms);
+ try{return await api(path,{method:"POST",body:fd,signal:ctl.signal});}
+ catch(e){throw e.name==="AbortError"?new Error("timed out after "+ms/1000+"s (file too heavy or AI busy)"):e;}
+ finally{clearTimeout(t);}}
+function showDetail(p){
+ const rows=[["Name",p.name],["Email",p.email],["Phone",p.phone],["Location",p.location],["Language",p.language],["Current role",p.current_role],["Experience",p.years_experience&&p.years_experience+" years"],["Summary",p.summary],["Skills",(p.skills||[]).join(", ")],
+  ["Education",(p.education||[]).map(x=>[x.degree,x.school,x.year].filter(Boolean).join(", ")).join("; ")],["Work history",(p.experience||[]).map(x=>esc(x.title||"")+" @ "+esc(x.company||"")+" ("+esc(x.start||"?")+"–"+esc(x.end||"now")+")").join("<br>")]];
+ const d=$("#parseDetail");d.style.display="";
+ d.innerHTML="<h2>Parsed data</h2><dl class='fields'>"+rows.filter(r=>r[1]).map(r=>`<dt>${r[0]}</dt><dd>${r[0]==="Work history"?r[1]:esc(r[1])}</dd>`).join("")+"</dl>";}
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function parseFiles(files){
  files=[...files].slice(0,25);if(!files.length)return;
@@ -36,9 +45,9 @@ async function parseFiles(files){
   for(let a=0;a<4;a++){
    c[1].textContent=a?"Retrying…":"Parsing…";
    try{const p=await upload("/parse",files[i]);c[1].textContent="Done ✓";
-    [p.name,p.email,p.phone,p.current_role].forEach((v,k)=>c[k+2].textContent=v||"");ok++;break;
+    [p.name,p.email,p.phone,p.current_role].forEach((v,k)=>c[k+2].textContent=v||"");const tr=$("#pr"+i);tr.style.cursor="pointer";tr.onclick=()=>showDetail(p);showDetail(p);ok++;break;
    }catch(err){
-    if(/429|rate|quota|exhausted/i.test(err.message)&&a<3){c[1].textContent="Rate limit, waiting 30s…";await sleep(30000);continue;}
+    if(/429|503|rate|quota|exhausted|unavailable|high demand/i.test(err.message)&&a<3){c[1].textContent="AI busy, retrying in 20s…";await sleep(20000);continue;}
     c[1].textContent="Failed: "+err.message;c[1].style.whiteSpace="normal";break;}
   }
  }
@@ -62,4 +71,4 @@ $("#send").onclick=async()=>{
   $("#sendMsg").textContent="Sending "+r.queued+" "+channel+" messages. Overview counters update as they finish.";setTimeout(load,4000);
  }catch(err){$("#sendMsg").textContent=err.message;}
  $("#send").disabled=false;};
-load().catch(e=>{$("#sendMsg").textContent=e.message});
+load().catch(e=>{$("#banner").textContent="Server problem: "+e.message+" — open /api/health for details."});

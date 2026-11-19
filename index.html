@@ -76,6 +76,7 @@ textarea{min-height:150px;resize:vertical}
 <main>
 <header><b id="title">Overview</b><span>George Avgenakis</span></header>
 
+<div id="banner" role="alert" style="color:#c0392b;padding:0 0 14px"></div>
 <section class="view on" id="overview">
   <h2>Statistics</h2>
   <div class="grid">
@@ -98,8 +99,9 @@ textarea{min-height:150px;resize:vertical}
     <div class="card"><h2>Upload a CV</h2>
       <label class="drop" for="cv">Drop up to 25 CVs here, or click to choose<br><small>PDF, DOCX, TXT or image, max 4 MB each. Any language.</small></label>
       <input id="cv" type="file" accept=".pdf,.docx,.png,.jpg,.jpeg,.webp,.txt" multiple hidden>
-      <p class="note">Parsed with Claude and saved to your candidate list.</p></div>
-    <div class="card"><h2>Extracted data</h2><div id="parsed" class="note">Upload a CV to see the extracted fields.</div></div>
+      <p class="note">Parsed by AI and saved to your candidate list.</p></div>
+    <div class="card"><h2>Results</h2><p class="note" id="parseSum">CVs are processed one at a time. Keep this tab open until all show Done.</p><div class="scroll" id="parseWrap" style="display:none"><table><thead><tr><th>File</th><th>Status</th><th>Name</th><th>Email</th><th>Phone</th><th>Role</th></tr></thead><tbody id="parseRows"></tbody></table></div><p class="note">Click a row to see everything extracted from that CV.</p></div>
+    <div class="card" id="parseDetail" style="display:none"></div>
   </div>
 </section>
 
