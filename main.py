@@ -121,40 +121,103 @@ def to_block(fn: str, data: bytes):
 def gemini(block):
     part = {"text": block["text"]} if block["type"] == "text" else \
         {"inline_data": {"mime_type": block["source"]["media_type"], "data": block["source"]["data"]}}
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    r = httpx.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                   headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]},
-                   json={"contents": [{"parts": [part, {"text": PROMPT}]}],
-                         "generationConfig": {"responseMimeType": "application/json"}}, timeout=120)
-    if r.status_code != 200:
-        raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:200]}")
-    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    models = [os.getenv("GEMINI_MODEL", "gemini-3.8-flash")]
+    if os.getenv("GEMINI_FALLBACK_MODEL"):
+        models.append(os.getenv("GEMINI_FALLBACK_MODEL"))
+    body = {"contents": [{"parts": [part, {"text": PROMPT}]}], "generationConfig": {"responseMimeType": "application/json"}}
+    err = ""
+    for model in models:
+        for attempt in range(2):  # retry temporary overloads (503) and rate limits (429)
+            r = httpx.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                           headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]}, json=body, timeout=120)
+            if r.status_code == 200:
+                return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            err = f"Gemini HTTP {r.status_code} ({model}): {r.text[:200]}"
+            if r.status_code in (429, 503):
+                time.sleep(1.5)
+                continue
+            break
+    raise RuntimeError(err)
+
+def ai_parse(fn, data):
+    block = to_block(fn, data)
+    if os.getenv("GEMINI_API_KEY") and not os.getenv("ANTHROPIC_API_KEY"):
+        raw = gemini(block)
+    else:
+        import anthropic
+        msg = anthropic.Anthropic().messages.create(
+            model=os.getenv("MODEL", "claude-sonnet-5-5"), max_tokens=2500,
+            messages=[{"role": "user", "content": [block, {"type": "text", "text": PROMPT}]}])
+        raw = "".join(b.text for b in msg.content if b.type == "text")
+    m = re.search(r"\{.*\}", raw, re.S)
+    if not m:
+        raise ValueError("the AI returned no data: " + raw[:120])
+    p = json.loads(m.group(0))
+    if not (p.get("name") or p.get("email") or p.get("phone")):
+        raise ValueError("no candidate details found (scanned/blank file?)")
+    p["parser"] = "ai"
+    return p
+
+SKILLS = ["python", "java", "javascript", "typescript", "sql", "excel", "react", "node.js", "php", "laravel", "django", "flask",
+          "aws", "azure", "docker", "git", "html", "css", "c++", "c#", ".net", "linux", "wordpress", "seo", "marketing", "sales",
+          "accounting", "quickbooks", "photoshop", "figma", "power bi", "tableau", "machine learning", "data analysis",
+          "recruitment", "customer service", "project management", "communication", "leadership", "autocad", "sap"]
+ROLES = r"engineer|developer|manager|accountant|analyst|designer|recruiter|officer|teacher|consultant|executive|assistant|administrator|specialist|lead|director|intern"
+
+def cv_text(fn, data):
+    if fn.lower().endswith(".pdf"):
+        from pypdf import PdfReader
+        text = "\n".join((pg.extract_text() or "") for pg in PdfReader(io.BytesIO(data)).pages)
+    else:
+        b = to_block(fn, data)
+        if b["type"] != "text":
+            raise ValueError("image CVs need the AI parser (basic parser reads PDF, DOCX and TXT only)")
+        text = b["text"][8:]
+    if len(text.strip()) < 20:
+        raise ValueError("no readable text (scanned PDF?). Basic parser cannot read scanned files.")
+    return text
+
+def basic_parse(fn, data):
+    text = cv_text(fn, data)
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    low = text.lower()
+    em = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
+    ph = re.search(r"(?<!\d)(\+?\d[\d\s().-]{8,16}\d)(?!\d)", text)
+    name = next((l for l in lines[:10] if 2 <= len(l.split()) <= 4 and not re.search(r"[\d@:/]", l)
+                 and not re.search(r"resume|curriculum|vitae|\bcv\b|profile|contact", l, re.I) and not re.search(ROLES, l, re.I)), None)
+    role = next((l[:80] for l in lines[:15] if re.search(ROLES, l, re.I) and "@" not in l and len(l) < 80), None)
+    loc = re.search(r"(?:address|location|city)\s*[:\-]\s*(.+)", text, re.I)
+    yrs = [int(x) for x in re.findall(r"(\d{1,2})\+?\s*(?:years|yrs)", low)]
+    edu = [{"school": None, "degree": l[:100], "year": (re.search(r"(19|20)\d\d", l) or [None])[0]}
+           for l in lines if re.search(r"bachelor|master|\bb\.?sc\b|\bm\.?sc\b|\bmba\b|ph\.?d|diploma|intermediate|matric|\bb\.?s\b|\bm\.?s\b", l, re.I)][:3]
+    return {"name": name, "email": em.group(0) if em else None, "phone": ph.group(1) if ph else None,
+            "location": loc.group(1).strip()[:80] if loc else None, "language": None, "current_role": role,
+            "years_experience": max(yrs) if yrs else None,
+            "skills": [k for k in SKILLS if re.search(r"(?<![\w])" + re.escape(k) + r"(?![\w])", low)],
+            "education": edu, "experience": [], "summary": None, "parser": "basic"}
 
 @app.post("/api/parse")
 def parse(file: UploadFile = File(...)):
     data = file.file.read()
     if len(data) > 4_000_000:
         raise HTTPException(413, "File too large (4 MB max on Vercel).")
-    try:
-        block = to_block(file.filename, data)
-        if os.getenv("GEMINI_API_KEY") and not os.getenv("ANTHROPIC_API_KEY"):
-            raw = gemini(block)  # free tier
-        else:
-            import anthropic
-            msg = anthropic.Anthropic().messages.create(
-                model=os.getenv("MODEL", "claude-sonnet-5-5"), max_tokens=2500,
-                messages=[{"role": "user", "content": [block, {"type": "text", "text": PROMPT}]}])
-            raw = "".join(b.text for b in msg.content if b.type == "text")
-        m = re.search(r"\{.*\}", raw, re.S)
-        if not m:
-            raise ValueError("the AI returned no data: " + raw[:120])
-        p = json.loads(m.group(0))
-        if not (p.get("name") or p.get("email") or p.get("phone")):
-            raise ValueError("no candidate details found (scanned/blank file?)")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(502, f"Parsing failed: {e}")
+    p, note = None, ""
+    if os.getenv("PARSER", "auto") != "basic" and (os.getenv("GEMINI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")):
+        try:
+            p = ai_parse(file.filename, data)
+        except HTTPException:
+            raise
+        except Exception as e:
+            note = str(e)[:160]
+    if p is None:  # AI off or failed: fall back to the built-in parser (no API, no limits)
+        try:
+            p = basic_parse(file.filename, data)
+            if note:
+                p["note"] = "AI unavailable, basic parser used: " + note
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(502, "Parsing failed: " + (note + " | " if note else "") + str(e))
     p["phone"] = re.sub(r"[^\d+]", "", p.get("phone") or "")
     try:
         cid = q("INSERT INTO candidates(name,email,phone,role,location,language,data,source,created) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -168,17 +231,28 @@ def parse(file: UploadFile = File(...)):
 KEYS = {"name": ["name"], "email": ["mail"], "phone": ["phone", "mobile", "whatsapp", "tel"],
         "role": ["role", "title", "position"], "location": ["location", "city", "country"]}
 
+def cell(v):
+    if v is None:
+        return ""
+    if isinstance(v, float) and v == int(v):
+        return str(int(v))
+    return str(v)
+
 @app.post("/api/sheet")
 def sheet(file: UploadFile = File(...)):
     data, fn = file.file.read(), file.filename.lower()
     if fn.endswith(".xlsx"):
         import openpyxl
         ws = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True).active
-        rows = [[("" if v is None else str(v)) for v in r] for r in ws.iter_rows(values_only=True)]
+        rows = [[cell(v) for v in r] for r in ws.iter_rows(values_only=True)]
+    elif fn.endswith(".xls"):
+        import xlrd
+        sh = xlrd.open_workbook(file_contents=data).sheet_by_index(0)
+        rows = [[cell(sh.cell_value(r, c)) for c in range(sh.ncols)] for r in range(sh.nrows)]
     elif fn.endswith(".csv"):
         rows = list(csv.reader(io.StringIO(data.decode("utf-8-sig", "ignore"))))
     else:
-        raise HTTPException(400, "Upload a .csv or .xlsx file.")
+        raise HTTPException(400, "Upload a .csv, .xlsx or .xls file.")
     if len(rows) < 2:
         raise HTTPException(400, "The file has no data rows.")
     head = [h.strip().lower() for h in rows[0]]

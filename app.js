@@ -44,7 +44,7 @@ async function parseFiles(files){
   const c=$("#pr"+i).children;
   for(let a=0;a<4;a++){
    c[1].textContent=a?"Retrying…":"Parsing…";
-   try{const p=await upload("/parse",files[i]);c[1].textContent="Done ✓";
+   try{const p=await upload("/parse",files[i]);c[1].textContent=p.parser==="basic"?"Done ✓ (basic)":"Done ✓";c[1].title=p.note||"";
     [p.name,p.email,p.phone,p.current_role].forEach((v,k)=>c[k+2].textContent=v||"");const tr=$("#pr"+i);tr.style.cursor="pointer";tr.onclick=()=>showDetail(p);showDetail(p);ok++;break;
    }catch(err){
     if(/429|503|rate|quota|exhausted|unavailable|high demand/i.test(err.message)&&a<3){c[1].textContent="AI busy, retrying in 20s…";await sleep(20000);continue;}

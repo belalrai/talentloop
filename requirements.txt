@@ -4,4 +4,6 @@ httpx
 anthropic
 python-docx
 openpyxl
+xlrd
+pypdf
 psycopg[binary]
