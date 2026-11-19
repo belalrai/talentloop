@@ -103,7 +103,12 @@ def parse(file: UploadFile = File(...)):
                 model=os.getenv("MODEL", "claude-sonnet-5-5"), max_tokens=2500,
                 messages=[{"role": "user", "content": [block, {"type": "text", "text": PROMPT}]}])
             raw = "".join(b.text for b in msg.content if b.type == "text")
-        p = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            raise ValueError("the AI returned no data: " + raw[:120])
+        p = json.loads(m.group(0))
+        if not (p.get("name") or p.get("email") or p.get("phone")):
+            raise ValueError("no candidate details found (scanned/blank file?)")
     except HTTPException:
         raise
     except Exception as e:
